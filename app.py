@@ -43,8 +43,7 @@ sessions = {}
 # ════════════════════════════════════════════════════
 @app.route('/health')
 def health():
-    return jsonify({'ok': True, 'time': int(time.time())})
-
+    return jsonify({'ok': True, 'time': int(time.time()), 'name': 'shem OG'})
 
 # ════════════════════════════════════════════════════
 # ASK  — proxies question to OpenRouter
