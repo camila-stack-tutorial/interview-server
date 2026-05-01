@@ -1,52 +1,41 @@
 """
-Interview Assistant — Flask Backend v7
-- AI: OpenRouter (google/gemma-3-4b-it:free)
-- Payments: IntaSend (M-Pesa + Card, Kenya)
+Interview Assistant — Flask Backend
+Handles: Claude API proxy, payment initiation via IntaSend, webhook verification
 """
 
-import os, time, threading, requests as req
+import os, time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from dotenv import load_dotenv
-
-load_dotenv()  # loads .env file automatically when running locally
+import anthropic
+import requests as req
 
 app = Flask(__name__)
 CORS(app)
 
-# ── Config — load from environment variables (.env file)
-OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
-INTASEND_API_KEY   = os.environ.get('INTASEND_API_KEY', '')    # publishable key
-INTASEND_SECRET    = os.environ.get('INTASEND_SECRET', '')     # secret key
-BASE_URL           = os.environ.get('BASE_URL', 'http://localhost:5000')
+ANTHROPIC_API_KEY        = os.environ.get('ANTHROPIC_API_KEY', '')
+INTASEND_PUBLISHABLE_KEY = os.environ.get('INTASEND_PUBLISHABLE_KEY', '')
+INTASEND_SECRET_KEY      = os.environ.get('INTASEND_SECRET_KEY', '')
+INTASEND_WEBHOOK_SECRET  = os.environ.get('INTASEND_WEBHOOK_SECRET', '')
+IS_TEST                  = os.environ.get('INTASEND_TEST', 'true').lower() == 'true'
 
-OPENROUTER_URL  = 'https://openrouter.ai/api/v1/chat/completions'
-OPENROUTER_MODEL = 'google/gemma-3-4b-it:free'
-
-# ── Model speed mapping
-# OpenRouter free tier uses the same model regardless of speed,
-# but we adjust max_tokens to keep fast responses lean
-SPEED_TOKENS = {
-    'fast':     250,
-    'balanced': 350,
-    'best':     500,
+MODELS = {
+    'fast':     ('claude-haiku-4-5-20251001', 280),
+    'balanced': ('claude-sonnet-4-6',          350),
+    'best':     ('claude-opus-4-6',            400),
 }
 
-# ── In-memory session store
-# Structure: { uid: { status, minutes, topup_status, topup_pending_minutes } }
-# Replace with Redis or SQLite for production multi-worker deployments
 sessions = {}
-
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ════════════════════════════════════════════════════
-# HEALTH CHECK
+# HEALTH
 # ════════════════════════════════════════════════════
 @app.route('/health')
 def health():
-    return jsonify({'ok': True, 'time': int(time.time()), 'name': 'shem OG'})
+    return jsonify({'ok': True, 'time': int(time.time()), 'name': 'Shem is On You'})
 
 # ════════════════════════════════════════════════════
-# ASK  — proxies question to OpenRouter
+# ASK CLAUDE
 # ════════════════════════════════════════════════════
 @app.route('/ask', methods=['POST'])
 def ask():
@@ -54,116 +43,113 @@ def ask():
     uid           = data.get('uid', '')
     question      = data.get('question', '').strip()
     system_prompt = data.get('system_prompt', 'You are a helpful interview coach.')
-    history       = data.get('history', [])   # list of {role, content}
+    history       = data.get('history', [])
     speed         = data.get('speed', 'fast')
 
     if not question:
         return jsonify({'error': 'No question provided'}), 400
 
-    if not OPENROUTER_API_KEY:
-        return jsonify({'error': 'OpenRouter API key not configured on server'}), 500
+    session = sessions.get(uid)
+    if not session or session.get('status') != 'paid':
+        return jsonify({'error': 'Session not authorised'}), 403
 
-    max_tokens = SPEED_TOKENS.get(speed, 250)
-
-    # Build message list: system + last 12 history turns + new question
-    messages = [{'role': 'system', 'content': system_prompt}]
-    messages += history[-12:]
-    messages.append({'role': 'user', 'content': question})
+    model, max_tokens = MODELS.get(speed, MODELS['fast'])
+    messages = history[-12:] + [{'role': 'user', 'content': question}]
 
     try:
-        response = req.post(
-            OPENROUTER_URL,
-            headers={
-                'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-                'Content-Type': 'application/json',
-                # OpenRouter recommends these headers for tracking/ranking
-                'HTTP-Referer': BASE_URL,
-                'X-Title': 'Interview Assistant',
-            },
-            json={
-                'model': OPENROUTER_MODEL,
-                'messages': messages,
-                'max_tokens': max_tokens,
-                'temperature': 0.7,
-            },
-            timeout=30   # generous timeout for free-tier model
+        response = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system_prompt,
+            messages=messages
         )
-
-        if response.status_code != 200:
-            err = response.json()
-            msg = err.get('error', {}).get('message', f'OpenRouter error {response.status_code}')
-            return jsonify({'error': msg}), 502
-
-        result = response.json()
-        reply  = result['choices'][0]['message']['content'].strip()
-        return jsonify({'reply': reply})
-
-    except req.exceptions.Timeout:
-        return jsonify({'error': 'AI response timed out — please try again'}), 504
-    except Exception as e:
+        return jsonify({'reply': response.content[0].text})
+    except anthropic.APIError as e:
         return jsonify({'error': str(e)}), 500
-
 
 # ════════════════════════════════════════════════════
 # PAYMENT — INITIATE
-# Calls IntaSend hosted checkout API
-# Docs: https://developers.intasend.com/docs/checkout
 # ════════════════════════════════════════════════════
+@app.route('/payment/initiate', methods=['POST'])
+def payment_initiate():
+    data     = request.get_json(force=True)
+    uid      = data.get('uid')
+    amount   = data.get('amount')
+    minutes  = data.get('minutes')
+    currency = data.get('currency', 'KES')
+    method   = data.get('method', 'M-PESA')   # 'M-PESA' or 'CARD-PAYMENT'
+    phone    = data.get('phone', '')
+
+    if not uid or not amount or not minutes:
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    sessions[uid] = {'status': 'pending', 'pending_minutes': minutes}
+
+    base = 'https://sandbox.intasend.com' if IS_TEST else 'https://payment.intasend.com'
+    headers = {
+        'Authorization': f'Bearer {INTASEND_SECRET_KEY}',
+        'Content-Type': 'application/json'
+    }
+    payload = {
+        'public_key': INTASEND_PUBLISHABLE_KEY,
+        'currency':   currency,
+        'amount':     amount,
+        'api_ref':    uid,
+        'comment':    f'Interview session {minutes}min',
+        'method':     method,
+        'redirect_url': 'https://uqmuqzybwnfy.eu-central-1.clawcloudrun.com/health'
+    }
+
+    # Only include phone for M-Pesa
+    if method == 'M-PESA' and phone:
+        payload['phone_number'] = phone
+
+    try:
+        r    = req.post(f'{base}/api/v1/checkout/', json=payload, headers=headers, timeout=8)
+        resp = r.json()
+        url  = resp.get('url', '')
+        if not url:
+            print('IntaSend initiate error:', resp)
+            return jsonify({'error': 'Failed to create checkout'}), 500
+        return jsonify({'payment_url': url, 'uid': uid})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # ════════════════════════════════════════════════════
-# PAYMENT — STATUS POLL (extension polls this every 5s)
+# PAYMENT — STATUS POLL
 # ════════════════════════════════════════════════════
 @app.route('/payment/status')
 def payment_status():
-    uid     = request.args.get('uid', '')
-    session = sessions.get(uid, {})
-    status  = session.get('status', 'pending')
+    uid    = request.args.get('uid', '')
+    status = sessions.get(uid, {}).get('status', 'pending')
     return jsonify({'status': status})
 
 # ════════════════════════════════════════════════════
-# PAYMENT — WEBHOOK (IntaSend posts here on completion)
+# PAYMENT — WEBHOOK
 # ════════════════════════════════════════════════════
 @app.route('/payment/webhook', methods=['POST'])
 def payment_webhook():
-    data      = request.get_json(force=True)
-    challenge = data.get('challenge', '')
+    data = request.get_json(force=True)
+    print('IntaSend webhook payload:', data)
 
-    # Validate challenge
+    challenge = data.get('challenge', '')
     if challenge != INTASEND_WEBHOOK_SECRET:
         return jsonify({'error': 'Unauthorised'}), 401
 
-    print('IntaSend webhook payload:', data)
-
     state = data.get('state', '')
-
-    uid = (
-        request.args.get('session_id')
-        or data.get('session_id')
-        or data.get('metadata', {}).get('session_id', '')
-    )
+    uid   = data.get('api_ref', '')
 
     if state == 'COMPLETE' and uid:
         if uid not in sessions:
             sessions[uid] = {}
-        sessions[uid]['status'] = 'paid'
+        sessions[uid]['status']  = 'paid'
+        sessions[uid]['minutes'] = sessions[uid].get('pending_minutes', 0)
+    elif state == 'FAILED' and uid:
+        if uid not in sessions:
+            sessions[uid] = {}
+        sessions[uid]['status'] = 'failed'
 
     return jsonify({'ok': True})
 
-# ════════════════════════════════════════════════════
-# DEV NOTICE PAGE (shown in dev mode instead of real payment)
-# ════════════════════════════════════════════════════
-@app.route('/payment/dev-notice')
-def dev_notice():
-    return '''<!DOCTYPE html>
-            <html>
-            <head><meta charset="UTF-8"/><title>Dev Mode</title></head>
-            <body style="font-family:sans-serif;text-align:center;padding:60px 20px;background:#0d0f14;color:#fff">
-              <div style="font-size:2.5rem;margin-bottom:12px">&#x1F6E0;</div>
-              <h2 style="color:#5ab8e8;margin-bottom:8px">Dev Mode — No Real Payment</h2>
-              <p style="color:#888;font-size:.9rem">Payment will auto-confirm in ~8 seconds.<br/>Close this tab and watch the extension.</p>
-            </body>
-            </html>'''
-
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
-
