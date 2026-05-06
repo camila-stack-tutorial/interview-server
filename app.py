@@ -12,11 +12,15 @@ import requests as req
 app = Flask(__name__)
 CORS(app)
 
-ANTHROPIC_API_KEY        = os.environ.get('ANTHROPIC_API_KEY', '')
-INTASEND_PUBLISHABLE_KEY = os.environ.get('INTASEND_PUBLISHABLE_KEY', '')
-INTASEND_SECRET_KEY      = os.environ.get('INTASEND_SECRET_KEY', '')
-INTASEND_WEBHOOK_SECRET  = os.environ.get('INTASEND_WEBHOOK_SECRET', '')
-IS_TEST                  = os.environ.get('INTASEND_TEST', 'true').lower() == 'true'
+def get_env():
+    """Read env vars fresh each time — avoids stale startup reads."""
+    return {
+        'ANTHROPIC_API_KEY':        os.environ.get('ANTHROPIC_API_KEY', ''),
+        'INTASEND_PUBLISHABLE_KEY': os.environ.get('INTASEND_PUBLISHABLE_KEY', ''),
+        'INTASEND_SECRET_KEY':      os.environ.get('INTASEND_SECRET_KEY', ''),
+        'INTASEND_WEBHOOK_SECRET':  os.environ.get('INTASEND_WEBHOOK_SECRET', ''),
+        'IS_TEST':                  os.environ.get('INTASEND_TEST', 'true').lower() == 'true',
+    }
 
 MODELS = {
     'fast':     ('claude-haiku-4-5-20251001', 280),
@@ -25,7 +29,6 @@ MODELS = {
 }
 
 sessions = {}
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ════════════════════════════════════════════════════
 # HEALTH
@@ -35,10 +38,25 @@ def health():
     return jsonify({'ok': True, 'time': int(time.time()), 'name': 'Shem is On You'})
 
 # ════════════════════════════════════════════════════
+# DEBUG — remove after confirming env vars work
+# ════════════════════════════════════════════════════
+@app.route('/debug/env')
+def debug_env():
+    env = get_env()
+    return jsonify({
+        'anthropic_key':  env['ANTHROPIC_API_KEY'][:10]        if env['ANTHROPIC_API_KEY']        else 'EMPTY',
+        'secret_key':     env['INTASEND_SECRET_KEY'][:10]      if env['INTASEND_SECRET_KEY']      else 'EMPTY',
+        'pub_key':        env['INTASEND_PUBLISHABLE_KEY'][:10] if env['INTASEND_PUBLISHABLE_KEY'] else 'EMPTY',
+        'webhook_secret': env['INTASEND_WEBHOOK_SECRET'][:6]   if env['INTASEND_WEBHOOK_SECRET']  else 'EMPTY',
+        'is_test':        env['IS_TEST'],
+    })
+
+# ════════════════════════════════════════════════════
 # ASK CLAUDE
 # ════════════════════════════════════════════════════
 @app.route('/ask', methods=['POST'])
 def ask():
+    env           = get_env()
     data          = request.get_json(force=True)
     uid           = data.get('uid', '')
     question      = data.get('question', '').strip()
@@ -57,6 +75,7 @@ def ask():
     messages = history[-12:] + [{'role': 'user', 'content': question}]
 
     try:
+        client   = anthropic.Anthropic(api_key=env['ANTHROPIC_API_KEY'])
         response = client.messages.create(
             model=model,
             max_tokens=max_tokens,
@@ -72,6 +91,7 @@ def ask():
 # ════════════════════════════════════════════════════
 @app.route('/payment/initiate', methods=['POST'])
 def payment_initiate():
+    env      = get_env()
     data     = request.get_json(force=True)
     uid      = data.get('uid')
     amount   = data.get('amount')
@@ -83,20 +103,23 @@ def payment_initiate():
     if not uid or not amount or not minutes:
         return jsonify({'error': 'Missing required fields'}), 400
 
+    if not env['INTASEND_SECRET_KEY']:
+        return jsonify({'error': 'Server misconfiguration: missing payment keys'}), 500
+
     sessions[uid] = {'status': 'pending', 'pending_minutes': minutes}
 
-    base = 'https://sandbox.intasend.com' if IS_TEST else 'https://payment.intasend.com'
+    base = 'https://sandbox.intasend.com' if env['IS_TEST'] else 'https://payment.intasend.com'
     headers = {
-        'Authorization': f'Bearer {INTASEND_SECRET_KEY}',
-        'Content-Type': 'application/json'
+        'Authorization': f'Bearer {env["INTASEND_SECRET_KEY"]}',
+        'Content-Type':  'application/json'
     }
     payload = {
-        'public_key': INTASEND_PUBLISHABLE_KEY,
-        'currency':   currency,
-        'amount':     amount,
-        'api_ref':    uid,
-        'comment':    f'Interview session {minutes}min',
-        'method':     method,
+        'public_key':   env['INTASEND_PUBLISHABLE_KEY'],
+        'currency':     currency,
+        'amount':       amount,
+        'api_ref':      uid,
+        'comment':      f'Interview session {minutes}min',
+        'method':       method,
         'redirect_url': 'https://uqmuqzybwnfy.eu-central-1.clawcloudrun.com/health'
     }
 
@@ -112,11 +135,11 @@ def payment_initiate():
         invoice_id = resp.get('id', '')
 
         if not url:
-            return jsonify({'error': 'Failed to create checkout'}), 500
+            print('IntaSend error detail:', resp)
+            return jsonify({'error': 'Failed to create checkout', 'detail': resp}), 500
 
-        # Store invoice_id → uid mapping for webhook lookup
-        sessions[uid]['invoice_id'] = invoice_id
-        sessions[f'inv_{invoice_id}'] = uid
+        sessions[uid]['invoice_id']      = invoice_id
+        sessions[f'inv_{invoice_id}']    = uid
 
         return jsonify({'payment_url': url, 'uid': uid})
     except Exception as e:
@@ -142,10 +165,8 @@ def payment_webhook():
     invoice_id = data.get('invoice_id', '')
     state      = data.get('state', '')
 
-    # Look up the uid via invoice_id
     uid = sessions.get(f'inv_{invoice_id}')
     if not uid:
-        # Fallback: try api_ref in case it wasn't overwritten
         uid = data.get('api_ref', '')
         if not uid or uid not in sessions:
             print(f'Webhook: unknown invoice_id={invoice_id}, ignoring')
