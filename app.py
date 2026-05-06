@@ -127,6 +127,9 @@ def payment_initiate():
         payload['phone_number'] = phone
 
     try:
+        print('IntaSend request URL:', f'{base}/api/v1/checkout/')
+        print('IntaSend request headers:', headers)
+        print('IntaSend request payload:', payload)
         r    = req.post(f'{base}/api/v1/checkout/', json=payload, headers=headers, timeout=8)
         resp = r.json()
         print('IntaSend initiate response:', resp)
