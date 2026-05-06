@@ -77,7 +77,7 @@ def payment_initiate():
     amount   = data.get('amount')
     minutes  = data.get('minutes')
     currency = data.get('currency', 'KES')
-    method   = data.get('method', 'M-PESA')   # 'M-PESA' or 'CARD-PAYMENT'
+    method   = data.get('method', 'M-PESA')
     phone    = data.get('phone', '')
 
     if not uid or not amount or not minutes:
@@ -100,17 +100,24 @@ def payment_initiate():
         'redirect_url': 'https://uqmuqzybwnfy.eu-central-1.clawcloudrun.com/health'
     }
 
-    # Only include phone for M-Pesa
     if method == 'M-PESA' and phone:
         payload['phone_number'] = phone
 
     try:
         r    = req.post(f'{base}/api/v1/checkout/', json=payload, headers=headers, timeout=8)
         resp = r.json()
-        url  = resp.get('url', '')
+        print('IntaSend initiate response:', resp)
+
+        url        = resp.get('url', '')
+        invoice_id = resp.get('id', '')
+
         if not url:
-            print('IntaSend initiate error:', resp)
             return jsonify({'error': 'Failed to create checkout'}), 500
+
+        # Store invoice_id → uid mapping for webhook lookup
+        sessions[uid]['invoice_id'] = invoice_id
+        sessions[f'inv_{invoice_id}'] = uid
+
         return jsonify({'payment_url': url, 'uid': uid})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -132,24 +139,29 @@ def payment_webhook():
     data = request.get_json(force=True)
     print('IntaSend webhook payload:', data)
 
-    challenge = data.get('challenge', '')
-    if challenge != INTASEND_WEBHOOK_SECRET:
-        return jsonify({'error': 'Unauthorised'}), 401
+    invoice_id = data.get('invoice_id', '')
+    state      = data.get('state', '')
 
-    state = data.get('state', '')
-    uid   = data.get('api_ref', '')
+    # Look up the uid via invoice_id
+    uid = sessions.get(f'inv_{invoice_id}')
+    if not uid:
+        # Fallback: try api_ref in case it wasn't overwritten
+        uid = data.get('api_ref', '')
+        if not uid or uid not in sessions:
+            print(f'Webhook: unknown invoice_id={invoice_id}, ignoring')
+            return jsonify({'ok': True}), 200
 
-    if state == 'COMPLETE' and uid:
-        if uid not in sessions:
-            sessions[uid] = {}
+    if state == 'COMPLETE':
         sessions[uid]['status']  = 'paid'
         sessions[uid]['minutes'] = sessions[uid].get('pending_minutes', 0)
-    elif state == 'FAILED' and uid:
-        if uid not in sessions:
-            sessions[uid] = {}
+        print(f'Webhook: uid={uid} marked PAID')
+    elif state == 'FAILED':
         sessions[uid]['status'] = 'failed'
+        print(f'Webhook: uid={uid} marked FAILED')
+    else:
+        print(f'Webhook: uid={uid} state={state} — no action')
 
-    return jsonify({'ok': True})
+    return jsonify({'ok': True}), 200
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
