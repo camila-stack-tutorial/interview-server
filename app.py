@@ -1,6 +1,6 @@
 """
 Interview Assistant — Flask Backend
-Handles: Claude API proxy, payment initiation via IntaSend, webhook verification
+Handles: Claude API proxy, payment session registration, webhook verification
 """
 
 import os, time
@@ -13,7 +13,6 @@ app = Flask(__name__)
 CORS(app)
 
 def get_env():
-    """Read env vars fresh each time — avoids stale startup reads."""
     return {
         'ANTHROPIC_API_KEY':        os.environ.get('ANTHROPIC_API_KEY', ''),
         'INTASEND_PUBLISHABLE_KEY': os.environ.get('INTASEND_PUBLISHABLE_KEY', ''),
@@ -87,66 +86,46 @@ def ask():
         return jsonify({'error': str(e)}), 500
 
 # ════════════════════════════════════════════════════
-# PAYMENT — INITIATE
+# PAYMENT — REGISTER SESSION (called before IntaSend popup opens)
+# Stores uid + minutes so webhook or /confirm can find it
 # ════════════════════════════════════════════════════
-@app.route('/payment/initiate', methods=['POST'])
-def payment_initiate():
-    env      = get_env()
-    data     = request.get_json(force=True)
-    uid      = data.get('uid')
-    amount   = data.get('amount')
-    minutes  = data.get('minutes')
-    currency = data.get('currency', 'KES')
-    method   = data.get('method', 'M-PESA')
-    phone    = data.get('phone', '')
+@app.route('/payment/session', methods=['POST'])
+def payment_session():
+    data    = request.get_json(force=True)
+    uid     = data.get('uid')
+    minutes = data.get('minutes')
 
-    if not uid or not amount or not minutes:
-        return jsonify({'error': 'Missing required fields'}), 400
-
-    if not env['INTASEND_SECRET_KEY']:
-        return jsonify({'error': 'Server misconfiguration: missing payment keys'}), 500
+    if not uid or not minutes:
+        return jsonify({'error': 'Missing uid or minutes'}), 400
 
     sessions[uid] = {'status': 'pending', 'pending_minutes': minutes}
+    print(f'Session registered: uid={uid} minutes={minutes}')
+    return jsonify({'ok': True})
 
-    base = 'https://sandbox.intasend.com' if env['IS_TEST'] else 'https://payment.intasend.com'
-    headers = {
-        'Authorization': f'Bearer {env["INTASEND_SECRET_KEY"]}',
-        'Content-Type':  'application/json'
-    }
-    payload = {
-        'public_key':   env['INTASEND_PUBLISHABLE_KEY'],
-        'currency':     currency,
-        'amount':       amount,
-        'api_ref':      uid,
-        'comment':      f'Interview session {minutes}min',
-        'method':       method,
-        'redirect_url': 'https://uqmuqzybwnfy.eu-central-1.clawcloudrun.com/health'
-    }
+# ════════════════════════════════════════════════════
+# PAYMENT — CONFIRM (called by frontend on IntaSend COMPLETE event)
+# IntaSend's inline SDK fires COMPLETE in the browser — we trust it
+# and mark the session paid immediately
+# ════════════════════════════════════════════════════
+@app.route('/payment/confirm', methods=['POST'])
+def payment_confirm():
+    data = request.get_json(force=True)
+    uid  = data.get('uid')
 
-    if method == 'M-PESA' and phone:
-        payload['phone_number'] = phone
+    if not uid:
+        return jsonify({'error': 'Missing uid'}), 400
 
-    try:
-        print('IntaSend request URL:', f'{base}/api/v1/checkout/')
-        print('IntaSend request headers:', headers)
-        print('IntaSend request payload:', payload)
-        r    = req.post(f'{base}/api/v1/checkout/', json=payload, headers=headers, timeout=8)
-        resp = r.json()
-        print('IntaSend initiate response:', resp)
+    session = sessions.get(uid)
+    if not session:
+        # Session wasn't pre-registered (race condition) — create it
+        sessions[uid] = {'status': 'paid', 'minutes': 60, 'pending_minutes': 60}
+        print(f'Confirm: uid={uid} — new session created and marked PAID')
+        return jsonify({'ok': True})
 
-        url        = resp.get('url', '')
-        invoice_id = resp.get('id', '')
-
-        if not url:
-            print('IntaSend error detail:', resp)
-            return jsonify({'error': 'Failed to create checkout', 'detail': resp}), 500
-
-        sessions[uid]['invoice_id']      = invoice_id
-        sessions[f'inv_{invoice_id}']    = uid
-
-        return jsonify({'payment_url': url, 'uid': uid})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    sessions[uid]['status']  = 'paid'
+    sessions[uid]['minutes'] = sessions[uid].get('pending_minutes', 60)
+    print(f'Confirm: uid={uid} marked PAID via frontend COMPLETE event')
+    return jsonify({'ok': True})
 
 # ════════════════════════════════════════════════════
 # PAYMENT — STATUS POLL
@@ -158,7 +137,7 @@ def payment_status():
     return jsonify({'status': status})
 
 # ════════════════════════════════════════════════════
-# PAYMENT — WEBHOOK
+# PAYMENT — WEBHOOK (IntaSend server-side callback — backup confirmation)
 # ════════════════════════════════════════════════════
 @app.route('/payment/webhook', methods=['POST'])
 def payment_webhook():
@@ -172,12 +151,12 @@ def payment_webhook():
     if not uid:
         uid = data.get('api_ref', '')
         if not uid or uid not in sessions:
-            print(f'Webhook: unknown invoice_id={invoice_id}, ignoring')
+            print(f'Webhook: unknown invoice_id={invoice_id} api_ref={uid}, ignoring')
             return jsonify({'ok': True}), 200
 
     if state == 'COMPLETE':
         sessions[uid]['status']  = 'paid'
-        sessions[uid]['minutes'] = sessions[uid].get('pending_minutes', 0)
+        sessions[uid]['minutes'] = sessions[uid].get('pending_minutes', 60)
         print(f'Webhook: uid={uid} marked PAID')
     elif state == 'FAILED':
         sessions[uid]['status'] = 'failed'
