@@ -3,10 +3,9 @@ Interview Assistant — Flask Backend
 Handles: Claude API proxy, payment session registration, webhook verification
 """
 
-import os, time
+import os, time, json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import anthropic
 import requests as req
 
 app = Flask(__name__)
@@ -14,18 +13,22 @@ CORS(app)
 
 def get_env():
     return {
-        'ANTHROPIC_API_KEY':        os.environ.get('ANTHROPIC_API_KEY', ''),
+        'OPENROUTER_API_KEY':       os.environ.get('OPENROUTER_API_KEY', ''),
         'INTASEND_PUBLISHABLE_KEY': os.environ.get('INTASEND_PUBLISHABLE_KEY', ''),
         'INTASEND_SECRET_KEY':      os.environ.get('INTASEND_SECRET_KEY', ''),
         'INTASEND_WEBHOOK_SECRET':  os.environ.get('INTASEND_WEBHOOK_SECRET', ''),
         'IS_TEST':                  os.environ.get('INTASEND_TEST', 'true').lower() == 'true',
     }
 
+# OpenRouter model mapping
+# All free tier — swap to paid models when ready
 MODELS = {
-    'fast':     ('claude-haiku-4-5-20251001', 280),
-    'balanced': ('claude-sonnet-4-6',          350),
-    'best':     ('claude-opus-4-6',            400),
+    'fast':     'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+    'balanced': 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+    'best':     'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
 }
+
+OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
 
 sessions = {}
 
@@ -43,15 +46,15 @@ def health():
 def debug_env():
     env = get_env()
     return jsonify({
-        'anthropic_key':  env['ANTHROPIC_API_KEY'][:10]        if env['ANTHROPIC_API_KEY']        else 'EMPTY',
-        'secret_key':     env['INTASEND_SECRET_KEY'][:10]      if env['INTASEND_SECRET_KEY']      else 'EMPTY',
-        'pub_key':        env['INTASEND_PUBLISHABLE_KEY'][:10] if env['INTASEND_PUBLISHABLE_KEY'] else 'EMPTY',
-        'webhook_secret': env['INTASEND_WEBHOOK_SECRET'][:6]   if env['INTASEND_WEBHOOK_SECRET']  else 'EMPTY',
+        'openrouter_key': env['OPENROUTER_API_KEY'][:10]        if env['OPENROUTER_API_KEY']        else 'EMPTY',
+        'secret_key':     env['INTASEND_SECRET_KEY'][:10]       if env['INTASEND_SECRET_KEY']       else 'EMPTY',
+        'pub_key':        env['INTASEND_PUBLISHABLE_KEY'][:10]  if env['INTASEND_PUBLISHABLE_KEY']  else 'EMPTY',
+        'webhook_secret': env['INTASEND_WEBHOOK_SECRET'][:6]    if env['INTASEND_WEBHOOK_SECRET']   else 'EMPTY',
         'is_test':        env['IS_TEST'],
     })
 
 # ════════════════════════════════════════════════════
-# ASK CLAUDE
+# ASK — OpenRouter
 # ════════════════════════════════════════════════════
 @app.route('/ask', methods=['POST'])
 def ask():
@@ -70,24 +73,42 @@ def ask():
     if not session or session.get('status') != 'paid':
         return jsonify({'error': 'Session not authorised'}), 403
 
-    model, max_tokens = MODELS.get(speed, MODELS['fast'])
-    messages = history[-12:] + [{'role': 'user', 'content': question}]
+    model = MODELS.get(speed, MODELS['fast'])
+
+    # Build message list: system prompt first, then history, then current question
+    messages = [{'role': 'system', 'content': system_prompt}]
+    messages += history[-12:]
+    messages.append({'role': 'user', 'content': question})
 
     try:
-        client   = anthropic.Anthropic(api_key=env['ANTHROPIC_API_KEY'])
-        response = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system_prompt,
-            messages=messages
+        response = req.post(
+            url=OPENROUTER_URL,
+            headers={
+                'Authorization': f"Bearer {env['OPENROUTER_API_KEY']}",
+                'Content-Type':  'application/json',
+            },
+            data=json.dumps({
+                'model':     model,
+                'messages':  messages,
+                'reasoning': {'enabled': True}
+            }),
+            timeout=30
         )
-        return jsonify({'reply': response.content[0].text})
-    except anthropic.APIError as e:
-        return jsonify({'error': str(e)}), 500
+        response.raise_for_status()
+        result  = response.json()
+        message = result['choices'][0]['message']
+        reply   = message.get('content') or ''
+        return jsonify({'reply': reply})
+
+    except req.exceptions.Timeout:
+        return jsonify({'error': 'Request timed out — please try again'}), 504
+    except req.exceptions.RequestException as e:
+        return jsonify({'error': f'OpenRouter error: {str(e)}'}), 500
+    except (KeyError, IndexError) as e:
+        return jsonify({'error': f'Unexpected response format: {str(e)}'}), 500
 
 # ════════════════════════════════════════════════════
-# PAYMENT — REGISTER SESSION (called before IntaSend popup opens)
-# Stores uid + minutes so webhook or /confirm can find it
+# PAYMENT — REGISTER SESSION
 # ════════════════════════════════════════════════════
 @app.route('/payment/session', methods=['POST'])
 def payment_session():
@@ -103,9 +124,7 @@ def payment_session():
     return jsonify({'ok': True})
 
 # ════════════════════════════════════════════════════
-# PAYMENT — CONFIRM (called by frontend on IntaSend COMPLETE event)
-# IntaSend's inline SDK fires COMPLETE in the browser — we trust it
-# and mark the session paid immediately
+# PAYMENT — CONFIRM (frontend IntaSend COMPLETE event)
 # ════════════════════════════════════════════════════
 @app.route('/payment/confirm', methods=['POST'])
 def payment_confirm():
@@ -117,7 +136,6 @@ def payment_confirm():
 
     session = sessions.get(uid)
     if not session:
-        # Session wasn't pre-registered (race condition) — create it
         sessions[uid] = {'status': 'paid', 'minutes': 60, 'pending_minutes': 60}
         print(f'Confirm: uid={uid} — new session created and marked PAID')
         return jsonify({'ok': True})
@@ -137,7 +155,7 @@ def payment_status():
     return jsonify({'status': status})
 
 # ════════════════════════════════════════════════════
-# PAYMENT — WEBHOOK (IntaSend server-side callback — backup confirmation)
+# PAYMENT — WEBHOOK (IntaSend server-side backup confirmation)
 # ════════════════════════════════════════════════════
 @app.route('/payment/webhook', methods=['POST'])
 def payment_webhook():
